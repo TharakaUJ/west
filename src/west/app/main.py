@@ -93,6 +93,7 @@ class EarlyArgs(NamedTuple):
     version: bool  # True if -V was given
     zephyr_base: str | None  # -z argument value
     verbosity: int  # 0 if not given, otherwise counts
+    color: str | None  # --color argument value ('always', 'never', 'auto')
     command_name: str | None
 
     # Other arguments are appended here.
@@ -106,16 +107,18 @@ def parse_early_args(argv: list[str]) -> EarlyArgs:
     version = False
     zephyr_base = None
     verbosity = 0
+    color = None
     command_name = None
     unexpected_arguments = []
 
     expecting_zephyr_base = False
+    expecting_color = False
 
     def consume_more_args(rest):
         # Handle the 'Vv' portion of 'west -hVv'.
 
-        nonlocal help, version, zephyr_base, verbosity
-        nonlocal expecting_zephyr_base
+        nonlocal help, version, zephyr_base, verbosity, color
+        nonlocal expecting_zephyr_base, expecting_color
 
         if not rest:
             return
@@ -145,6 +148,13 @@ def parse_early_args(argv: list[str]) -> EarlyArgs:
     for arg in argv:
         if expecting_zephyr_base:
             zephyr_base = arg
+            expecting_zephyr_base = False
+        elif expecting_color:
+            if arg in ('always', 'never', 'auto'):
+                color = arg
+            else:
+                unexpected_arguments.append(f'--color={arg}')
+            expecting_color = False
         elif arg.startswith('-h'):
             help = True
             consume_more_args(arg[2:])
@@ -170,13 +180,23 @@ def parse_early_args(argv: list[str]) -> EarlyArgs:
                 zephyr_base = arg[3:]
             else:
                 zephyr_base = arg[2:]
+        elif arg == '--color':
+            expecting_color = True
+        elif arg.startswith('--color='):
+            color_val = arg[8:]
+            if color_val in ('always', 'never', 'auto'):
+                color = color_val
+            else:
+                unexpected_arguments.append(arg)
         elif arg.startswith('-'):
             unexpected_arguments.append(arg)
         else:
             command_name = arg
             break
 
-    return EarlyArgs(help, version, zephyr_base, verbosity, command_name, unexpected_arguments)
+    return EarlyArgs(
+        help, version, zephyr_base, verbosity, color, command_name, unexpected_arguments
+    )
 
 
 class LogFormatter(logging.Formatter):
@@ -222,6 +242,7 @@ class WestApp:
         self.subparser_gen = None  # an add_subparsers() return value
         self.cmd = None  # west.commands.WestCommand, eventually
         self.queued_io = []  # I/O hooks we want self.cmd to do
+        self.color_mode = None  # 'always', 'never', 'auto', or None
 
         for group, classes in BUILTIN_COMMAND_GROUPS.items():
             lst = [cls() for cls in classes]
@@ -253,9 +274,8 @@ class WestApp:
         # Use verbosity to determine west API log levels
         self.setup_west_logging(early_args.verbosity)
 
-        # Makes ANSI color escapes work on Windows, and strips them when
-        # stdout/stderr isn't a terminal
-        colorama.init()
+        # Store color mode for later use
+        self.color_mode = early_args.color
 
         # See if we're in a workspace. It's fine if we're not.
         # Note that this falls back on searching from ZEPHYR_BASE
@@ -272,6 +292,9 @@ class WestApp:
         # Also set up the global configuration object to match, for
         # backwards compatibility.
         self.config._copy_to_configparser(west.configuration.config)
+
+        # Initialize colorama after config is loaded so we can read color.ui setting
+        self.init_colorama()
 
         # Set self.manifest and self.extensions.
         self.load_manifest()
@@ -576,6 +599,13 @@ class WestApp:
             help='print the program version and exit',
         )
 
+        parser.add_argument(
+            '--color',
+            choices=['always', 'never', 'auto'],
+            default=None,
+            help='when to colorize output (always, never, auto)',
+        )
+
         subparser_gen = parser.add_subparsers(metavar='<command>', dest='command')
 
         return parser, subparser_gen
@@ -739,12 +769,45 @@ class WestApp:
 
         logger.addHandler(LogHandler())
 
+    def init_colorama(self):
+        color_mode = self.color_mode
+
+        if color_mode is None and self.config:
+            config_value = self.config.get('color.ui', 'auto')
+            # Handle both string values (always/never/auto) and
+            # boolean values (true/false) for backward compatibility
+            if config_value in ('always', 'never', 'auto'):
+                color_mode = config_value
+            elif config_value in ('true', 'True', '1'):
+                color_mode = 'always'
+            elif config_value in ('false', 'False', '0'):
+                color_mode = 'never'
+            else:
+                color_mode = 'auto'
+
+        if color_mode == 'always':
+            colorama.init(strip=False)
+        elif color_mode == 'never':
+            colorama.init(strip=True)
+        else:
+            # 'auto' or None: use colorama's default behavior
+            colorama.init()
+
+    def apply_color_override(self):
+        if self.color_mode == 'always':
+            self.cmd._color_override = True
+        elif self.color_mode == 'never':
+            self.cmd._color_override = False
+        # For 'auto' or None, don't set override (use config)
+
     def run_builtin(self, args, unknown):
         self.queued_io.append(
             lambda cmd: cmd.dbg('args namespace:', args, level=Verbosity.DBG_EXTREME)
         )
         self.cmd = self.builtins.get(args.command, self.builtins['help'])
         adjust_command_verbosity(self.cmd, args)
+        self.apply_color_override()
+
         if self.mle:
             self.handle_builtin_manifest_load_err(args)
         for io_hook in self.queued_io:
@@ -771,6 +834,8 @@ class WestApp:
         args, unknown = west_parser.parse_known_args(argv)
 
         adjust_command_verbosity(self.cmd, args)
+        self.apply_color_override()
+
         self.queued_io.append(
             lambda cmd: cmd.dbg('args namespace:', args, level=Verbosity.DBG_EXTREME)
         )

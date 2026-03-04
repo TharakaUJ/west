@@ -167,6 +167,7 @@ class WestCommand(ABC):
         self.manifest = None
         self.config = None
         self._hooks: list[Callable[[WestCommand], None]] = []
+        self._color_override: bool | None = None
 
     def add_pre_run_hook(self, hook: Callable[['WestCommand'], None]) -> None:
         '''Add a hook which will be called right before do_run().
@@ -544,6 +545,8 @@ class WestCommand(ABC):
     @property
     def color_ui(self) -> bool:
         '''Should we colorize output?'''
+        if self._color_override is not None:
+            return self._color_override
         return self.config.getboolean('color.ui', default=True) if self.has_config else True
 
     #
